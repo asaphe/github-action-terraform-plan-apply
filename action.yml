@@ -1,0 +1,239 @@
+name: "Terraform Plan and Apply"
+description: "Composite action to run Terraform plan and apply with flexible parameters."
+
+inputs:
+  working-directory:
+    description: "Directory to run Terraform in"
+    required: true
+  workspace:
+    description: "Terraform workspace name (or base name for loop)"
+    required: true
+  var-file:
+    description: "Path to .tfvars file(s) (relative to working-directory). Can be newline-separated for multiple files."
+    required: false
+  plan-targets:
+    description: "Whitespace or newline-separated list of Terraform targets (optional)"
+    required: false
+  parallelism:
+    description: "Parallelism for apply (optional)"
+    required: false
+  plan-only:
+    description: "If true, only run plan, not apply"
+    required: false
+    default: "false"
+  loop-over-tfvars:
+    description: "If true, loop over all .tfvars files in var-file directory"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Terraform Init
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd '${{ inputs.working-directory }}'
+        terraform init
+
+    - name: Terraform Plan/Apply (Single or Loop)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd '${{ inputs.working-directory }}'
+
+        # This function runs plan and apply for a given workspace and optional var-file
+        run_terraform() {
+          local workspace_name="$1"
+          local tfvars_file_path="$2"
+          local plan_cmd=("plan" "-refresh=true" "-input=false" "-out=plan.tfplan")
+
+          echo "==> Selecting workspace: $workspace_name"
+          terraform workspace select -or-create=true "$workspace_name"
+
+          # --- Build plan command array ---
+          if [[ -n "$tfvars_file_path" ]]; then
+            # Support multiple var files separated by newlines
+            while IFS= read -r vf; do
+              [[ -z "$vf" ]] && continue
+              plan_cmd+=("-var-file" "$vf")
+            done <<< "$tfvars_file_path"
+          fi
+
+          # ---- Plan targets ----
+          if [[ -n '${{ inputs.plan-targets }}' ]]; then
+            local targets_raw='${{ inputs.plan-targets }}'
+            local target_args=()
+            # Normalize spaces to newlines, iterate, and build -target flags
+            while IFS= read -r t; do
+              [[ -z "$t" ]] && continue
+              target_args+=("-target=$t")
+            done <<< "$(printf '%s' "$targets_raw" | tr ' ' '\n')"
+            if [[ ${#target_args[@]} -gt 0 ]]; then
+              plan_cmd+=("${target_args[@]}")
+            fi
+          fi
+
+          # Pretty-print command with single quotes around target values for readability only
+          display_cmd=("${plan_cmd[@]}")
+          for i in "${!display_cmd[@]}"; do
+            if [[ "${display_cmd[$i]}" == -target=* ]]; then
+              val="${display_cmd[$i]#-target=}"
+              display_cmd[$i]="-target='${val}'"
+            fi
+          done
+          echo "Running: terraform ${display_cmd[*]}"
+          terraform "${plan_cmd[@]}"
+
+          # --- Build and run apply command ---
+          if [[ '${{ inputs.plan-only }}' != 'true' ]]; then
+            local apply_cmd=("apply" "-refresh=false" "-input=false" "-auto-approve")
+            if [[ -n "${{ inputs.parallelism }}" ]]; then
+              apply_cmd+=("-parallelism=${{ inputs.parallelism }}")
+            fi
+            apply_cmd+=("plan.tfplan")
+
+            echo "Running: terraform ${apply_cmd[*]}"
+            set +e
+            # Use process substitution to avoid SIGPIPE on long-running commands (e.g., RDS creation)
+            terraform "${apply_cmd[@]}" > >(tee /tmp/terraform_apply_output.log) 2>&1
+            apply_exit_code=$?
+            set -e
+
+            if [[ $apply_exit_code -ne 0 ]]; then
+              if grep -qiE "(Provider produced inconsistent result|ec2nodeclass-hash)" /tmp/terraform_apply_output.log; then
+                echo "⚠️  Detected Karpenter hash annotation inconsistency (known provider issue)"
+                echo "🔄 Refreshing state to sync hash annotation values..."
+                local refresh_cmd=("refresh" "-input=false")
+                if [[ -n "$tfvars_file_path" ]]; then
+                  while IFS= read -r vf; do
+                    [[ -z "$vf" ]] && continue
+                    refresh_cmd+=("-var-file" "$vf")
+                  done <<< "$tfvars_file_path"
+                fi
+                set +e
+                terraform "${refresh_cmd[@]}"
+                refresh_exit_code=$?
+                set -e
+                if [[ $refresh_exit_code -eq 0 ]]; then
+                  echo "✅ State refreshed successfully."
+                  echo "🔄 Re-running plan to verify state consistency..."
+                  terraform "${plan_cmd[@]}"
+                  plan_exit_code=$?
+                  if [[ $plan_exit_code -ne 0 ]]; then
+                    echo "❌ Plan failed after refresh (exit code: $plan_exit_code)"
+                    return $plan_exit_code
+                  fi
+                  echo "✅ Plan completed successfully after refresh."
+                  echo "🔄 Re-running apply to ensure all changes are applied..."
+                  terraform "${apply_cmd[@]}" > >(tee /tmp/terraform_apply_output.log) 2>&1
+                  apply_exit_code=$?
+                  if [[ $apply_exit_code -ne 0 ]]; then
+                    echo "❌ Apply failed after refresh (exit code: $apply_exit_code)"
+                    cat /tmp/terraform_apply_output.log
+                    return $apply_exit_code
+                  fi
+                  echo "✅ Apply completed successfully after refresh."
+                  rm -f /tmp/terraform_apply_output.log
+                  return 0
+                else
+                  echo "⚠️  Refresh had issues but continuing (exit code: $refresh_exit_code)"
+                  return 0
+                fi
+              else
+                echo "❌ Terraform apply failed with error (not hash annotation issue)"
+                echo ""
+
+                # Detect common error patterns and provide actionable guidance
+                if grep -qE "EntityAlreadyExists" /tmp/terraform_apply_output.log; then
+                  echo "::error title=Resource Already Exists::AWS resource exists but is not in Terraform state"
+                  echo ""
+                  echo "ℹ️  This usually happens when:"
+                  echo "   1. A previous workflow run created the resource but failed before updating state"
+                  echo "   2. The resource was created manually or by another process"
+                  echo ""
+                  echo "To fix, import the existing resource into Terraform state:"
+                  echo "   terraform import '<resource_address>' '<resource_id>'"
+                  echo ""
+                  echo "Example for IAM resources (note path prefix in ARN):"
+                  echo "   aws iam list-policies --scope Local --query 'Policies[?contains(PolicyName, \`<name>\`)].Arn'"
+                  echo "   terraform import 'module.policy.aws_iam_policy.this' '<full_arn_with_path>'"
+                  echo ""
+                elif grep -qE "AccessDenied|UnauthorizedOperation|is not authorized" /tmp/terraform_apply_output.log; then
+                  echo "::error title=Access Denied::AWS permissions issue"
+                  echo ""
+                  echo "ℹ️  Check that the IAM role has required permissions for this operation."
+                  echo "   Role ARN: Check the workflow's aws_role_arn output"
+                  echo ""
+                elif grep -qE "ResourceNotFoundException|NoSuchEntity|does not exist" /tmp/terraform_apply_output.log; then
+                  echo "::error title=Resource Not Found::A referenced resource does not exist"
+                  echo ""
+                  echo "ℹ️  This usually means:"
+                  echo "   1. A dependency was deleted outside Terraform"
+                  echo "   2. Wrong workspace selected (check workspace name)"
+                  echo "   3. Prerequisites not deployed yet"
+                  echo ""
+                elif grep -qE "InvalidParameterValue|ValidationError|InvalidInput" /tmp/terraform_apply_output.log; then
+                  echo "::error title=Invalid Parameter::Invalid configuration value"
+                  echo ""
+                  echo "ℹ️  Check the var-file values and module inputs for typos or invalid formats."
+                  echo ""
+                fi
+
+                cat /tmp/terraform_apply_output.log
+                return $apply_exit_code
+              fi
+            fi
+            rm -f /tmp/terraform_apply_output.log
+          fi
+        }
+
+        # --- Main logic ---
+        if [[ '${{ inputs.loop-over-tfvars }}' == 'true' ]]; then
+          # Check if var-file is a directory or a file
+          if [ -d "${{ inputs.var-file }}" ]; then
+            echo "==> Looping over tfvars files in directory '${{ inputs.var-file }}'"
+            # Directory: loop over all .tfvars files in the directory
+            found_files=0
+            for tfvars_file in "${{ inputs.var-file }}"/*.tfvars; do
+              if [ -f "$tfvars_file" ]; then
+                found_files=$((found_files + 1))
+                base_name=$(basename "$tfvars_file" .tfvars)
+                loop_workspace_name="${{ inputs.workspace }}-${base_name}"
+                run_terraform "$loop_workspace_name" "$tfvars_file"
+              fi
+            done
+            if [ $found_files -eq 0 ]; then
+              echo "::warning::No .tfvars files found in directory '${{ inputs.var-file }}'"
+            fi
+          elif [ -f "${{ inputs.var-file }}" ]; then
+            # Single file: treat as legacy pattern, use it directly (backward compatibility)
+            echo "⚠️  Legacy pattern detected: using single file '${{ inputs.var-file }}' with loop-over-tfvars"
+            echo "⚠️  Consider migrating to directory-based pattern: use 'vars/{deployment_name}/' directory"
+            base_name=$(basename "${{ inputs.var-file }}" .tfvars)
+            loop_workspace_name="${{ inputs.workspace }}-${base_name}"
+            run_terraform "$loop_workspace_name" "${{ inputs.var-file }}"
+          else
+            echo "::error::Path '${{ inputs.var-file }}' does not exist (neither directory nor file)"
+            exit 1
+          fi
+        else
+          echo "==> Running single plan/apply for workspace '${{ inputs.workspace }}'"
+          # Handle optional var-file(s) for single run - can be newline-separated
+          single_run_tfvars=""
+          if [[ -n '${{ inputs.var-file }}' ]]; then
+            # Process each var file (newline-separated)
+            while IFS= read -r vf; do
+              [[ -z "$vf" ]] && continue
+              if [[ -f "$vf" ]]; then
+                single_run_tfvars+="${vf}"$'\n'
+              elif [[ -f "./$vf" ]]; then
+                single_run_tfvars+="./${vf}"$'\n'
+              else
+                echo "Error: var-file '$vf' not found in working-directory or as absolute path." >&2
+                exit 1
+              fi
+            done <<< '${{ inputs.var-file }}'
+          fi
+          run_terraform "${{ inputs.workspace }}" "$single_run_tfvars"
+        fi
