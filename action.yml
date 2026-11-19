@@ -33,14 +33,16 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        cd '${{ inputs.working-directory }}'
+        cd "${INPUTS_WORKING_DIRECTORY}"
         terraform init
+      env:
+        INPUTS_WORKING_DIRECTORY: ${{ inputs.working-directory }}
 
     - name: Terraform Plan/Apply (Single or Loop)
       shell: bash
       run: |
         set -euo pipefail
-        cd '${{ inputs.working-directory }}'
+        cd "${INPUTS_WORKING_DIRECTORY}"
 
         # This function runs plan and apply for a given workspace and optional var-file
         run_terraform() {
@@ -61,8 +63,8 @@ runs:
           fi
 
           # ---- Plan targets ----
-          if [[ -n '${{ inputs.plan-targets }}' ]]; then
-            local targets_raw='${{ inputs.plan-targets }}'
+          if [[ -n "${INPUTS_PLAN_TARGETS}" ]]; then
+            local targets_raw="${INPUTS_PLAN_TARGETS}"
             local target_args=()
             # Normalize spaces to newlines, iterate, and build -target flags
             while IFS= read -r t; do
@@ -86,10 +88,10 @@ runs:
           terraform "${plan_cmd[@]}"
 
           # --- Build and run apply command ---
-          if [[ '${{ inputs.plan-only }}' != 'true' ]]; then
+          if [[ "${INPUTS_PLAN_ONLY}" != 'true' ]]; then
             local apply_cmd=("apply" "-refresh=false" "-input=false" "-auto-approve")
-            if [[ -n "${{ inputs.parallelism }}" ]]; then
-              apply_cmd+=("-parallelism=${{ inputs.parallelism }}")
+            if [[ -n "${INPUTS_PARALLELISM}" ]]; then
+              apply_cmd+=("-parallelism=${INPUTS_PARALLELISM}")
             fi
             apply_cmd+=("plan.tfplan")
 
@@ -189,39 +191,39 @@ runs:
         }
 
         # --- Main logic ---
-        if [[ '${{ inputs.loop-over-tfvars }}' == 'true' ]]; then
+        if [[ "${INPUTS_LOOP_OVER_TFVARS}" == 'true' ]]; then
           # Check if var-file is a directory or a file
-          if [ -d "${{ inputs.var-file }}" ]; then
-            echo "==> Looping over tfvars files in directory '${{ inputs.var-file }}'"
+          if [ -d "${INPUTS_VAR_FILE}" ]; then
+            echo "==> Looping over tfvars files in directory '${INPUTS_VAR_FILE}'"
             # Directory: loop over all .tfvars files in the directory
             found_files=0
-            for tfvars_file in "${{ inputs.var-file }}"/*.tfvars; do
+            for tfvars_file in "${INPUTS_VAR_FILE}"/*.tfvars; do
               if [ -f "$tfvars_file" ]; then
                 found_files=$((found_files + 1))
                 base_name=$(basename "$tfvars_file" .tfvars)
-                loop_workspace_name="${{ inputs.workspace }}-${base_name}"
+                loop_workspace_name="${INPUTS_WORKSPACE}-${base_name}"
                 run_terraform "$loop_workspace_name" "$tfvars_file"
               fi
             done
             if [ $found_files -eq 0 ]; then
-              echo "::warning::No .tfvars files found in directory '${{ inputs.var-file }}'"
+              echo "::warning::No .tfvars files found in directory '${INPUTS_VAR_FILE}'"
             fi
-          elif [ -f "${{ inputs.var-file }}" ]; then
+          elif [ -f "${INPUTS_VAR_FILE}" ]; then
             # Single file: treat as legacy pattern, use it directly (backward compatibility)
-            echo "⚠️  Legacy pattern detected: using single file '${{ inputs.var-file }}' with loop-over-tfvars"
+            echo "⚠️  Legacy pattern detected: using single file '${INPUTS_VAR_FILE}' with loop-over-tfvars"
             echo "⚠️  Consider migrating to directory-based pattern: use 'vars/{deployment_name}/' directory"
-            base_name=$(basename "${{ inputs.var-file }}" .tfvars)
-            loop_workspace_name="${{ inputs.workspace }}-${base_name}"
-            run_terraform "$loop_workspace_name" "${{ inputs.var-file }}"
+            base_name=$(basename "${INPUTS_VAR_FILE}" .tfvars)
+            loop_workspace_name="${INPUTS_WORKSPACE}-${base_name}"
+            run_terraform "$loop_workspace_name" "${INPUTS_VAR_FILE}"
           else
-            echo "::error::Path '${{ inputs.var-file }}' does not exist (neither directory nor file)"
+            echo "::error::Path '${INPUTS_VAR_FILE}' does not exist (neither directory nor file)"
             exit 1
           fi
         else
-          echo "==> Running single plan/apply for workspace '${{ inputs.workspace }}'"
+          echo "==> Running single plan/apply for workspace '${INPUTS_WORKSPACE}'"
           # Handle optional var-file(s) for single run - can be newline-separated
           single_run_tfvars=""
-          if [[ -n '${{ inputs.var-file }}' ]]; then
+          if [[ -n "${INPUTS_VAR_FILE}" ]]; then
             # Process each var file (newline-separated)
             while IFS= read -r vf; do
               [[ -z "$vf" ]] && continue
@@ -233,7 +235,15 @@ runs:
                 echo "Error: var-file '$vf' not found in working-directory or as absolute path." >&2
                 exit 1
               fi
-            done <<< '${{ inputs.var-file }}'
+            done <<< "${INPUTS_VAR_FILE}"
           fi
-          run_terraform "${{ inputs.workspace }}" "$single_run_tfvars"
+          run_terraform "${INPUTS_WORKSPACE}" "$single_run_tfvars"
         fi
+      env:
+        INPUTS_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUTS_PLAN_TARGETS: ${{ inputs.plan-targets }}
+        INPUTS_PLAN_ONLY: ${{ inputs.plan-only }}
+        INPUTS_PARALLELISM: ${{ inputs.parallelism }}
+        INPUTS_LOOP_OVER_TFVARS: ${{ inputs.loop-over-tfvars }}
+        INPUTS_VAR_FILE: ${{ inputs.var-file }}
+        INPUTS_WORKSPACE: ${{ inputs.workspace }}
